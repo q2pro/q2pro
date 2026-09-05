@@ -291,6 +291,28 @@ sv_prioritize_entities::
     that don't fit into frame. Sorting is potentially CPU intensive and thus
     disabled by default.
 
+sv_nc_visibilitycheck::
+    Server-side line-of-sight pass after PVS (NiceAss / NoCheat era, same
+    cvar names as R1Q2). A wallhack renderer that draws every received player
+    through walls then has nothing useful to draw. Traces from the viewer's
+    eyes to the target origin and bbox corners, with a short prediction retry
+    for lag. CPU intensive; leave off unless you need it (busy DM is the usual
+    case). Default value is 0.
+     - 0 — disabled
+     - 1 — hide the model (clear modelindex / vwep / skin). Footsteps and
+       events can still go out. If there are no effects, sounds, or events,
+       the entity is omitted entirely.
+     - 2 — do not send the player at all. Stronger against wallhacks; no
+       footsteps unless line of sight succeeds.
+    Any client can connect; stripping happens before the snapshot is sent.
+    This is not r1ch.net anticheat.dll. Can hide people you should see on thin
+    corners or with high lag. Not applied to the POV entity or to MVD/broadcast
+    spectators.
+
+sv_nc_clientsonly::
+    Only apply ‘sv_nc_visibilitycheck’ to other players, not every rocket or
+    gib. Default value is 1. Leave this on; checking all entities is expensive.
+
 Downloads
 ~~~~~~~~~
 

@@ -527,6 +527,101 @@ static int entnumcmp(const void *p1, const void *p2)
     return a->s.number - b->s.number;
 }
 
+static void SV_GetEdict_ViewAngles(const edict_t *ent, vec3_t angles)
+{
+    if (IS_NEW_GAME_API)
+        VectorCopy(((const gclient_new_t *)ent->client)->ps.viewangles, angles);
+    else
+        VectorCopy(((const gclient_old_t *)ent->client)->ps.viewangles, angles);
+}
+
+static void SV_GetEdict_Velocity(const edict_t *ent, vec3_t vel)
+{
+    if (!ent->client) {
+        VectorClear(vel);
+        return;
+    }
+    if (IS_NEW_GAME_API)
+        VectorCopy(((const gclient_new_t *)ent->client)->ps.pmove.velocity, vel);
+    else
+        VectorCopy(((const gclient_old_t *)ent->client)->ps.pmove.velocity, vel);
+}
+
+/*
+=============
+SV_CheckPlayerVisible
+
+NiceAss / NoCheat server-side LOS (ported from R1Q2). Traces from start to the
+entity origin and, on a full check, the 8 bbox corners.
+=============
+*/
+static bool SV_CheckPlayerVisible(const vec3_t angles, const vec3_t start,
+                                  const edict_t *ent, bool fullCheck, bool predictEnt)
+{
+    int     i, num;
+    vec3_t  ends[9];
+    vec3_t  entOrigin;
+    vec3_t  vel;
+    trace_t trace;
+
+    VectorCopy(ent->s.origin, entOrigin);
+
+    if (predictEnt && ent->client) {
+        SV_GetEdict_Velocity(ent, vel);
+        for (i = 0; i < 3; i++)
+            entOrigin[i] += vel[i] * 0.125f * 0.15f;
+    }
+
+    VectorCopy(entOrigin, ends[0]);
+
+    if (fullCheck) {
+        vec3_t right, up;
+
+        for (i = 1; i < 9; i++)
+            VectorCopy(entOrigin, ends[i]);
+
+        AngleVectors(angles, NULL, right, up);
+
+        ends[1][0] += ent->mins[0];
+        ends[2][0] += ent->mins[0];
+        ends[3][0] += ent->mins[0];
+        ends[4][0] += ent->mins[0];
+        ends[1][1] += ent->maxs[1];
+        ends[2][1] += ent->maxs[1];
+        ends[3][1] += ent->mins[1];
+        ends[4][1] += ent->mins[1];
+        ends[1][2] += ent->maxs[2];
+        ends[2][2] += ent->mins[2];
+        ends[3][2] += ent->maxs[2];
+        ends[4][2] += ent->mins[2];
+
+        ends[5][0] += ent->maxs[0];
+        ends[6][0] += ent->maxs[0];
+        ends[7][0] += ent->maxs[0];
+        ends[8][0] += ent->maxs[0];
+        ends[5][1] += ent->maxs[1];
+        ends[6][1] += ent->maxs[1];
+        ends[7][1] += ent->mins[1];
+        ends[8][1] += ent->mins[1];
+        ends[5][2] += ent->maxs[2];
+        ends[6][2] += ent->mins[2];
+        ends[7][2] += ent->maxs[2];
+        ends[8][2] += ent->mins[2];
+
+        num = 9;
+    } else {
+        num = 1;
+    }
+
+    for (i = 0; i < num; i++) {
+        trace = SV_Trace(start, NULL, NULL, ends[i], NULL, CONTENTS_SOLID);
+        if (trace.fraction == 1)
+            return true;
+    }
+
+    return false;
+}
+
 /*
 =============
 SV_BuildClientFrame
@@ -551,6 +646,7 @@ void SV_BuildClientFrame(client_t *client)
     int         max_packet_entities;
     edict_t     *edicts[MAX_EDICTS];
     int         num_edicts;
+    bool        nc_hide[MAX_EDICTS];
     qboolean (*visible)(edict_t *, edict_t *) = NULL;
     qboolean (*customize)(edict_t *, edict_t *, customize_entity_t *) = NULL;
     customize_entity_t temp;
@@ -624,6 +720,7 @@ void SV_BuildClientFrame(client_t *client)
     frame->first_entity = client->next_entity;
 
     num_edicts = 0;
+    memset(nc_hide, 0, sizeof(nc_hide));
     for (e = 1; e < client->ge->num_edicts; e++) {
         ent = EDICT_NUM2(client->ge, e);
 
@@ -691,6 +788,50 @@ void SV_BuildClientFrame(client_t *client)
         if (visible && !visible(clent, ent))
             continue;
 
+        // NiceAss / NoCheat LOS after PVS (sv_nc_visibilitycheck)
+        if (ent != clent
+#if USE_MVD_CLIENT
+            && sv.state != ss_broadcast
+#endif
+            && client->protocol >= 0  // skip MVD dummy (protocol = -1)
+            && sv_nc_visibilitycheck->integer
+            && !(sv_nc_clientsonly->integer && !ent->client)
+            && ent->solid != SOLID_BSP && ent->solid != SOLID_TRIGGER) {
+            vec3_t start, angles, vel;
+            bool nc_visible;
+
+            SV_GetEdict_ViewAngles(clent, angles);
+            VectorCopy(org, start);
+            nc_visible = SV_CheckPlayerVisible(angles, start, ent, true, false);
+
+            if (!nc_visible) {
+                VectorCopy(org, start);
+                SV_GetEdict_Velocity(clent, vel);
+                for (i = 0; i < 3; i++)
+                    start[i] += vel[i] * 0.125f * (0.15f + client->ping * 0.001f);
+
+                nc_visible = SV_CheckPlayerVisible(angles, start, ent, false, true);
+
+                if (!nc_visible) {
+                    VectorCopy(org, start);
+                    start[2] += ent->maxs[2];
+                    nc_visible = SV_CheckPlayerVisible(angles, start, ent, false, true);
+                }
+            }
+
+            // 2: omit entirely (no footsteps unless LOS)
+            if (!nc_visible && sv_nc_visibilitycheck->integer == 2)
+                continue;
+
+            // 1: omit if there is nothing but a model to hide
+            if (!nc_visible && sv_nc_visibilitycheck->integer == 1 &&
+                !ent->s.effects && !ent->s.sound && !ent->s.event)
+                continue;
+
+            if (!nc_visible)
+                nc_hide[e] = true;
+        }
+
         edicts[num_edicts++] = ent;
 
         if (num_edicts == max_packet_entities && !sv_prioritize_entities->integer)
@@ -722,6 +863,12 @@ void SV_BuildClientFrame(client_t *client)
             MSG_PackEntity(state, &temp.s, ENT_EXTENSION(client->csr, &temp));
         } else {
             MSG_PackEntity(state, &ent->s, ENT_EXTENSION(client->csr, ent));
+        }
+
+        // Send the entity without a model. Weaker than mode 2, keeps footsteps.
+        if (nc_hide[e]) {
+            state->modelindex = state->modelindex2 = state->modelindex3 = state->modelindex4 = 0;
+            state->skinnum = 0;
         }
 
 #if USE_FPS
